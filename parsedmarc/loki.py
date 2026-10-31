@@ -29,9 +29,10 @@ _LABEL_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # Per report type: the row field holding the domain the report is about,
 # and the row field with its begin time (and whether that value is UTC
-# without an offset; aggregate begin dates are naive local time).
+# without an offset; aggregate rows carry the record's interval_begin,
+# which parsedmarc builds as naive UTC wall-clock time).
 _REPORT_TYPES: dict[str, tuple[str, str, bool]] = {
-    "aggregate": ("domain", "begin_date", False),
+    "aggregate": ("domain", "begin_date", True),
     "failure": ("reported_domain", "arrival_date_utc", True),
     "smtp_tls": ("policy_domain", "begin_date", False),
 }
@@ -101,8 +102,11 @@ class LokiClient(object):
             if not _LABEL_NAME.match(name):
                 raise ValueError(f"Invalid Loki label name '{name}'")
 
-        stripped = url.rstrip("/")
-        self.url = stripped + PUSH_PATH if httpx.URL(url).path in ("", "/") else url
+        parsed = httpx.URL(url)
+        # copy_with(path=...) keeps any query string, userinfo and port intact
+        self.url = (
+            str(parsed.copy_with(path=PUSH_PATH)) if parsed.path in ("", "/") else url
+        )
         self.timestamp = timestamp
         self.timeout = timeout
         self.batch_size = max(1, int(batch_size))
@@ -113,8 +117,10 @@ class LokiClient(object):
         if tenant_id:
             headers["X-Scope-OrgID"] = tenant_id
         auth = httpx.BasicAuth(username or "", password or "") if username else None
+        # Redirects are not followed: httpx re-sends a 301/302 POST as a GET,
+        # which the target can answer 200 without storing anything.
         self.session = httpx.Client(
-            headers=headers, auth=auth, verify=verify, follow_redirects=True
+            headers=headers, auth=auth, verify=verify, follow_redirects=False
         )
 
     def save_aggregate_report_to_loki(
@@ -155,6 +161,13 @@ class LokiClient(object):
                     logger.debug(f"Unparsable {begin_field}, using ingest time")
             entries.append((self._stream_labels(line), ts + i, line))
 
+        # Loki only accepts out-of-order entries within half of max_chunk_age
+        # (so 1h by default) of the newest line in a stream, else it rejects
+        # them with too_far_behind. Aggregate rows come source-major then per
+        # day, so sort the whole list (not per push, which would still go
+        # backwards across batches).
+        entries.sort(key=lambda entry: entry[1])
+
         for start in range(0, len(entries), self.batch_size):
             self._push(entries[start : start + self.batch_size])
 
@@ -184,7 +197,11 @@ class LokiClient(object):
             )
         except httpx.HTTPError as error_:
             raise LokiError(f"Loki push to {self.url} failed: {error_}") from error_
-        if response.status_code >= 300:
+        # Loki answers 204 when it stored the push; 200 is also accepted.
+        # Other 2xx codes are not success: with block_ingestion_until set it
+        # returns a custom 260 and discards the logs
+        # (block_ingestion_status_code).
+        if response.status_code not in (200, 204):
             raise LokiError(
                 f"Loki push to {self.url} failed with HTTP "
                 f"{response.status_code}: {response.text[:500]}"
@@ -193,6 +210,3 @@ class LokiClient(object):
     def close(self):
         """Close the underlying HTTP session."""
         self.session.close()
-
-    # Backward-compatible alias
-    save_forensic_report_to_loki = save_failure_report_to_loki

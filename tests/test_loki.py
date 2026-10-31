@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 import unittest
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -98,6 +99,16 @@ class TestLokiClientInit(unittest.TestCase):
         for url in ("http://loki:3100", "http://loki:3100/"):
             client = LokiClient(url)
             self.assertEqual(client.url, "http://loki:3100/loki/api/v1/push")
+
+    def test_push_path_appended_before_query_string(self):
+        for url in (
+            "https://gw.example.org?route=logs",
+            "https://gw.example.org/?route=logs",
+        ):
+            client = LokiClient(url)
+            self.assertEqual(
+                client.url, "https://gw.example.org/loki/api/v1/push?route=logs"
+            )
 
     def test_explicit_push_path_kept(self):
         client = LokiClient("https://gw.example.org/custom/push")
@@ -215,7 +226,10 @@ class TestLokiAggregate(unittest.TestCase):
     def test_report_begin_timestamps(self, _rows):
         client = _client(timestamp="report_begin")
         client.save_aggregate_report_to_loki(AGGREGATE)
-        begin = human_timestamp_to_unix_timestamp("2026-10-20 00:00:00") * 10**9
+        begin = (
+            human_timestamp_to_unix_timestamp("2026-10-20 00:00:00", assume_utc=True)
+            * 10**9
+        )
         stamps = sorted(ts for _, ts, _ in _entries(client))
         self.assertEqual(stamps, [begin, begin + 1])
 
@@ -260,6 +274,29 @@ class TestLokiAggregate(unittest.TestCase):
         self.assertEqual(call.kwargs["timeout"], 12)
 
 
+class TestLokiOrdering(unittest.TestCase):
+    def test_report_begin_entries_sent_in_timestamp_order(self):
+        """Loki rejects entries more than max_chunk_age/2 behind the newest
+        line of a stream (too_far_behind), so entries must be pushed oldest
+        first even though normalized multi-day aggregate rows arrive
+        source-major: all days of one source, then back to day 1 for the
+        next source."""
+        rows = [
+            {"source_ip_address": ip, "begin_date": f"2024-01-{day:02d} 00:00:00"}
+            for ip in ("192.0.2.1", "192.0.2.2")
+            for day in (1, 2, 3)
+        ]
+        client = _client(timestamp="report_begin", batch_size=2)
+        with patch(
+            "parsedmarc.loki.parsed_aggregate_reports_to_csv_rows", return_value=rows
+        ):
+            client.save_aggregate_report_to_loki(cast(AggregateReport, {}))
+        stamps = [ts for _, ts, _ in _entries(client)]
+        self.assertEqual(len(stamps), 6)
+        self.assertEqual(len(_session(client).post.call_args_list), 3)
+        self.assertEqual(stamps, sorted(stamps))
+
+
 class TestLokiOtherReportTypes(unittest.TestCase):
     @patch(
         "parsedmarc.loki.parsed_failure_reports_to_csv_rows", return_value=FAILURE_ROWS
@@ -302,12 +339,6 @@ class TestLokiOtherReportTypes(unittest.TestCase):
         self.assertEqual(line["domain"], "a.example")
         self.assertEqual(line["report_type"], "aggregate")
 
-    def test_forensic_alias(self):
-        self.assertIs(
-            LokiClient.save_forensic_report_to_loki,
-            LokiClient.save_failure_report_to_loki,
-        )
-
 
 @patch(
     "parsedmarc.loki.parsed_aggregate_reports_to_csv_rows", return_value=AGGREGATE_ROWS
@@ -339,6 +370,42 @@ class TestLokiErrors(unittest.TestCase):
             client.save_aggregate_report_to_loki(AGGREGATE)
         self.assertIn("refused", str(ctx.exception))
 
+    def test_blocked_ingestion_status_raises(self, _rows):
+        """Loki returns 260 (block_ingestion_status_code default) and drops
+        the logs when ingestion is blocked; that must not read as success."""
+        client = _client()
+        response = _ok_response(260)
+        response.text = "ingestion blocked"
+        _session(client).post.return_value = response
+        with self.assertRaises(LokiError) as ctx:
+            client.save_aggregate_report_to_loki(AGGREGATE)
+        self.assertIn("260", str(ctx.exception))
+
+    def test_redirect_raises_and_is_not_followed(self, _rows):
+        """httpx turns a redirected POST into a GET, which the target would
+        answer 200 without storing anything; a 3xx must raise instead."""
+        requested = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            if request.url.host == "loki.example.org":
+                return httpx.Response(
+                    301, headers={"Location": "http://elsewhere.example.org/ok"}
+                )
+            return httpx.Response(200)
+
+        real_client = httpx.Client
+
+        def client_factory(**kwargs):
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        with patch("parsedmarc.loki.httpx.Client", side_effect=client_factory):
+            client = LokiClient("http://loki.example.org:3100")
+        with self.assertRaises(LokiError) as ctx:
+            client.save_aggregate_report_to_loki(AGGREGATE)
+        self.assertIn("301", str(ctx.exception))
+        self.assertEqual(requested, ["http://loki.example.org:3100/loki/api/v1/push"])
+
     def test_success_statuses(self, _rows):
         for status in (200, 204):
             client = _client()
@@ -348,6 +415,34 @@ class TestLokiErrors(unittest.TestCase):
 
 class TestLokiRealReports(unittest.TestCase):
     """End to end through parsedmarc's own row conversion."""
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "needs time.tzset")
+    def test_report_begin_is_utc_in_a_non_utc_timezone(self):
+        """The aggregate row's interval_begin is naive UTC, so the pushed
+        timestamp must equal the XML <begin> epoch whatever the local zone
+        (it was 4h late under America/New_York when read as local time)."""
+        old_tz = os.environ.get("TZ")
+
+        def restore():
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
+
+        self.addCleanup(restore)
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        path = os.path.join(
+            SAMPLES, "aggregate", "!example.com!1538204542!1538463818.xml"
+        )
+        report = parsedmarc.parse_report_file(path, offline=True)["report"]
+        client = _client(timestamp="report_begin")
+        client.save_aggregate_report_to_loki(cast(AggregateReport, report))
+        # <begin> of the sample is 1538413632; a one-day report is one record
+        # bucket, so every pushed entry starts at that epoch
+        stamps = {ts for _, ts, _ in _entries(client)}
+        self.assertEqual(stamps, {1538413632 * 10**9})
 
     def test_aggregate_sample(self):
         sample = os.path.join(
